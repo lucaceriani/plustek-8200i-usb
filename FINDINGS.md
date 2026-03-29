@@ -246,6 +246,30 @@ To reconstruct output row Y (using odd lines only):
 | Y offset (line 0 = ref row 0) | odd line 129 | 248 |
 | Column reorder split | 2058/2059 | 2092/2093 |
 
+## USB Replay: DMA Flow Control and Status Polls
+
+During a scan, SilverFast interleaves large data reads (~62 KB) with small 512-byte status
+polls — roughly one poll every three data reads, totaling ~2000 polls across a full scan.
+These polls are not just informational: they synchronize the host's read pointer with the
+scanner's circular DMA buffer on the GL128 chip.
+
+The scanner's CCD sensor writes scan data via DMA into a fixed-size RAM buffer on the chip.
+This buffer is circular — when the write pointer reaches the end, it wraps to address 0.
+The host reads from the same buffer via USB bulk transfers, advancing its own read pointer.
+As long as the read and write pointers advance in lockstep, data comes out in order.
+
+The 512-byte status polls maintain this synchronization. When they are omitted (e.g. by
+replacing the captured read pattern with continuous 64 KB bulk reads), the read pointer
+drifts relative to the write pointer. The result is an image that appears shifted by ~1/3
+of the frame — the scan data wraps around the circular buffer boundary, so the end of the
+image appears at the beginning of the file and vice versa.
+
+The correct approach for replay is to execute the exact captured op sequence (same read
+sizes, same order, including the 512-byte polls) but strip all artificial inter-op delays.
+The USB bulk reads block naturally until the scanner's DMA buffer has data available,
+providing implicit flow control without any `sleep()` calls. This achieves maximum USB
+transfer speed while keeping the image correctly aligned.
+
 ## Dependencies
 - numpy
 - tifffile

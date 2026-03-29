@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["pyusb", "tifffile", "numpy", "Pillow", "rich", "questionary"]
+# dependencies = ["pyusb", "tifffile", "numpy", "rich", "questionary"]
 # ///
 """
 Plustek OpticFilm 8200i (GL128) scan & extraction tool.
@@ -677,15 +677,84 @@ def find_scanner():
     return dev
 
 
+# The embedded ops list has three phases (determined by analyzing the pcap):
+#
+#   ops[0:2026]    — Setup & calibration. Register writes (CW), register reads
+#                    (CR), bulk writes (BW), and calibration bulk reads (BR).
+#                    Includes 11 calibration sub-scans. The inter-op delays from
+#                    the original capture MUST be preserved here: the scanner's
+#                    motor, lamp, and sensor need real settling time between
+#                    configuration steps. Delays >2s are capped (those were the
+#                    operator clicking through SilverFast's UI, not hardware).
+#
+#   ops[2026:7464] — Image data. A mix of large data reads (61952 bytes) and
+#                    small status polls (512 bytes) that SilverFast interleaved
+#                    for flow control. We replay these ops EXACTLY as captured
+#                    (same sizes, same order) but with ALL delays stripped.
+#                    The USB bulk reads naturally block until the scanner has
+#                    data, so the pacing is implicit — no sleeps needed.
+#                    IMPORTANT: skipping the 512-byte status polls or replacing
+#                    this with continuous large reads causes the image to shift
+#                    by ~1/3 — the polls synchronize our read position with the
+#                    scanner's circular DMA buffer.
+#
+#   ops[7464:]     — Cleanup. Register reads/writes to park the scan head and
+#                    power down. Replayed without delays.
+#
+SETUP_END = 2026
+
+
 def replay_ops(dev, timed_ops):
-    """Replay USB ops with original pcap timing."""
-    total = len(timed_ops)
+    """Replay the captured USB sequence in two phases.
+
+    Phase 1 (setup): Replay with original timing — the scanner hardware needs
+    real delays between register writes for motor/lamp/sensor settling.
+
+    Phase 2 (data + cleanup): Replay the exact same op sequence but with zero
+    delays. The ops include interleaved 512-byte status polls that act as DMA
+    flow control — we must keep them for correct image alignment, but the USB
+    reads block naturally until data is ready, so no artificial delays are
+    needed. This makes the data transfer as fast as USB allows.
+    """
     expected_bytes = 225_000_000
 
     raw_data = bytearray()
     errors = 0
     consecutive_br_fails = 0
 
+    # ── Phase 1: Setup & calibration (with timing) ──────────────────
+    # Delays are critical here: the scanner needs time between register
+    # writes to physically move the motor, warm the lamp, and stabilize
+    # the CCD sensor for each of the 11 calibration sub-scans.
+    with console.status("[bold blue]Calibrating...[/bold blue]"):
+        for delay_ms, op in timed_ops[:SETUP_END]:
+            # Preserve short hardware delays, cap long UI interaction gaps
+            if delay_ms > 2000:
+                time.sleep(0.1)
+            elif delay_ms > 1:
+                time.sleep(delay_ms / 1000.0)
+            try:
+                kind = op[0]
+                if kind == 'CW':
+                    dev.ctrl_transfer(op[1], op[2], op[3], op[4], op[5], CTRL_TIMEOUT)
+                elif kind == 'CR':
+                    dev.ctrl_transfer(op[1], op[2], op[3], op[4], op[5], CTRL_TIMEOUT)
+                elif kind == 'BW':
+                    dev.write(op[1], op[2], BULK_TIMEOUT)
+                elif kind == 'BR':
+                    result = dev.read(op[1], op[2], BULK_TIMEOUT)
+                    raw_data.extend(result)
+            except Exception:
+                errors += 1
+
+    console.print(f"  Calibration done ({len(raw_data) / 1024:.0f} KB read)", style="dim")
+
+    # ── Phase 2: Data + cleanup (no delays, natural USB pacing) ─────
+    # We replay the EXACT captured op sequence — including the 512-byte
+    # status polls between data reads — but without any sleep() calls.
+    # The bulk reads block until the scanner's DMA buffer has data,
+    # which provides natural flow control. The status polls keep our
+    # read pointer synchronized with the scanner's circular buffer.
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold blue]Scanning[/bold blue]"),
@@ -698,34 +767,24 @@ def replay_ops(dev, timed_ops):
     ) as prog:
         task = prog.add_task("scan", total=expected_bytes, size="0 MB")
 
-        for i, (delay_ms, op) in enumerate(timed_ops):
+        for _, op in timed_ops[SETUP_END:]:
             kind = op[0]
-
-            # Sleep the original delay (skip tiny <1ms, cap >2s UI interaction gaps)
-            if delay_ms > 2000:
-                time.sleep(0.1)
-            elif delay_ms > 1:
-                time.sleep(delay_ms / 1000.0)
-
             try:
                 if kind == 'CW':
-                    _, bmRT, bReq, wVal, wIdx, data = op
-                    dev.ctrl_transfer(bmRT, bReq, wVal, wIdx, data, CTRL_TIMEOUT)
+                    dev.ctrl_transfer(op[1], op[2], op[3], op[4], op[5], CTRL_TIMEOUT)
                 elif kind == 'CR':
-                    _, bmRT, bReq, wVal, wIdx, wLen = op
-                    dev.ctrl_transfer(bmRT, bReq, wVal, wIdx, wLen, CTRL_TIMEOUT)
+                    dev.ctrl_transfer(op[1], op[2], op[3], op[4], op[5], CTRL_TIMEOUT)
                 elif kind == 'BW':
-                    _, ep, data = op
-                    dev.write(ep, data, BULK_TIMEOUT)
+                    dev.write(op[1], op[2], BULK_TIMEOUT)
                 elif kind == 'BR':
-                    _, ep, expected_len = op
-                    result = dev.read(ep, expected_len, BULK_TIMEOUT)
+                    result = dev.read(op[1], op[2], BULK_TIMEOUT)
                     raw_data.extend(result)
 
                 consecutive_br_fails = 0
 
-            except Exception as e:
+            except Exception:
                 if kind == 'BR':
+                    # Consecutive BR failures after enough data = scan complete
                     consecutive_br_fails += 1
                     if consecutive_br_fails >= 3 and len(raw_data) > 10_000_000:
                         break
@@ -733,7 +792,7 @@ def replay_ops(dev, timed_ops):
                     consecutive_br_fails = 0
                     errors += 1
 
-            if len(raw_data) > 0 and i % 50 == 0:
+            if len(raw_data) > 0 and prog._tasks[task].completed != min(len(raw_data), expected_bytes):
                 mb = len(raw_data) / 1024 / 1024
                 prog.update(task, completed=min(len(raw_data), expected_bytes),
                             size=f"{mb:.1f} MB")
@@ -789,28 +848,7 @@ def extract_image(raw_data, output_file):
         tifffile.imwrite(output_file, result, photometric='rgb',
                          resolution=(SCAN_DPI, SCAN_DPI), resolutionunit=2)
 
-    _save_preview(result, output_file)
     return result
-
-
-def _save_preview(data, tiff_path, scale=2):
-    from PIL import Image
-
-    preview = data[::scale, ::scale, :].astype(np.float64)
-    for ch in range(3):
-        p1 = np.percentile(preview[:, :, ch], 1)
-        p99 = np.percentile(preview[:, :, ch], 99)
-        preview[:, :, ch] = (preview[:, :, ch] - p1) / max(p99 - p1, 1)
-    np.clip(preview, 0, 1, out=preview)
-    np.power(preview, 1 / 2.2, out=preview)
-    preview_8 = (preview * 255).astype(np.uint8)
-
-    preview_dir = os.path.join(os.path.dirname(tiff_path) or '.', 'previews')
-    os.makedirs(preview_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(tiff_path))[0]
-    preview_path = os.path.join(preview_dir, f"{base}_preview.png")
-    Image.fromarray(preview_8, 'RGB').save(preview_path)
-    console.print(f"  Preview: [dim]{preview_path}[/dim]")
 
 
 def _next_scan_name(folder):
@@ -864,8 +902,21 @@ def _show_folder_info(folder):
     console.print(f"  {len(other)} file(s) in folder, {len(tifs)} scan(s)", style="dim")
 
 
+def _default_scan_folder():
+    """Return default scan folder: $XDG_PICTURES_DIR/scans or ~/Pictures/scans or ~/scans."""
+    xdg_pics = os.environ.get('XDG_PICTURES_DIR')
+    if xdg_pics and os.path.isdir(xdg_pics):
+        return os.path.join(xdg_pics, 'scans')
+    pictures = os.path.expanduser('~/Pictures')
+    if os.path.isdir(pictures):
+        return os.path.join(pictures, 'scans')
+    return os.path.expanduser('~/scans')
+
+
 def interactive_setup():
     """Interactive folder/file selection. Returns output file path."""
+    default_folder = _default_scan_folder()
+
     # If a CLI arg was given, use it directly as folder
     if len(sys.argv) > 1:
         folder = sys.argv[1]
@@ -874,7 +925,7 @@ def interactive_setup():
         choice = questionary.select(
             'Output folder:',
             choices=[
-                questionary.Choice('Use ./scans (default)', value='default'),
+                questionary.Choice(f'Use {default_folder} (default)', value='default'),
                 questionary.Choice('Type a path', value='type'),
                 questionary.Choice('Browse (GUI file picker)', value='gui'),
             ],
@@ -887,18 +938,18 @@ def interactive_setup():
         if choice == 'gui':
             folder = _browse_gui()
             if not folder:
-                console.print("  GUI picker not available or cancelled, using ./scans", style="yellow")
-                folder = './scans'
+                console.print(f"  GUI picker not available or cancelled, using {default_folder}", style="yellow")
+                folder = default_folder
         elif choice == 'type':
             folder = questionary.path(
                 'Path:',
-                default='./scans',
+                default=default_folder,
                 only_directories=True,
             ).ask()
             if not folder:
                 raise KeyboardInterrupt
         else:
-            folder = './scans'
+            folder = default_folder
 
     folder = os.path.abspath(os.path.expanduser(folder))
 
