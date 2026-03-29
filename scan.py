@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ["pyusb", "tifffile", "numpy", "Pillow"]
+# dependencies = ["pyusb", "tifffile", "numpy", "Pillow", "rich", "questionary"]
 # ///
 """
 Plustek OpticFilm 8200i (GL128) scan & extraction tool.
@@ -10,7 +10,7 @@ Self-contained: the USB command sequence with original timing (extracted from
 a SilverFast 3200 DPI capture) is embedded directly.
 
 Usage:
-    uv run scan.py [output.tif]
+    uv run scan.py [output_folder]
 
 Requirements:
     - Plustek OpticFilm 8200i connected via USB
@@ -19,11 +19,20 @@ Requirements:
 
 import sys
 import os
+import re
+import glob
 import time
 import pickle
 import zlib
 import base64
 import numpy as np
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+import questionary
+
+console = Console()
 
 # Scanner identifiers
 VENDOR_ID = 0x07B3
@@ -645,7 +654,7 @@ def find_scanner():
 
     dev = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
     if dev is None:
-        print("ERROR: Scanner not found.")
+        console.print("[bold red]Scanner not found.[/bold red] Is it plugged in?")
         sys.exit(1)
 
     try:
@@ -653,8 +662,7 @@ def find_scanner():
         prod = dev.product or 'OpticFilm 8200i'
     except (ValueError, usb.core.USBError):
         mfr, prod = 'Plustek', 'OpticFilm 8200i'
-    print(f"Found scanner: {mfr} {prod}")
-    print(f"  Bus {dev.bus:03d} Device {dev.address:03d}")
+    console.print(f"  [green]{mfr} {prod}[/green] (bus {dev.bus:03d} dev {dev.address:03d})")
 
     if dev.is_kernel_driver_active(0):
         dev.detach_kernel_driver(0)
@@ -672,59 +680,67 @@ def find_scanner():
 def replay_ops(dev, timed_ops):
     """Replay USB ops with original pcap timing."""
     total = len(timed_ops)
-    print(f"  {total} operations to replay")
+    expected_bytes = 225_000_000
 
     raw_data = bytearray()
     errors = 0
-    last_progress = -1
     consecutive_br_fails = 0
 
-    for i, (delay_ms, op) in enumerate(timed_ops):
-        kind = op[0]
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]Scanning[/bold blue]"),
+        BarColumn(bar_width=40),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("[dim]{task.fields[size]}[/dim]"),
+        TimeElapsedColumn(),
+        console=console,
+        refresh_per_second=4,
+    ) as prog:
+        task = prog.add_task("scan", total=expected_bytes, size="0 MB")
 
-        # Sleep the original delay (skip tiny delays < 1ms for speed)
-        if delay_ms > 1:
-            time.sleep(delay_ms / 1000.0)
+        for i, (delay_ms, op) in enumerate(timed_ops):
+            kind = op[0]
 
-        try:
-            if kind == 'CW':
-                _, bmRT, bReq, wVal, wIdx, data = op
-                dev.ctrl_transfer(bmRT, bReq, wVal, wIdx, data, CTRL_TIMEOUT)
-            elif kind == 'CR':
-                _, bmRT, bReq, wVal, wIdx, wLen = op
-                dev.ctrl_transfer(bmRT, bReq, wVal, wIdx, wLen, CTRL_TIMEOUT)
-            elif kind == 'BW':
-                _, ep, data = op
-                dev.write(ep, data, BULK_TIMEOUT)
-            elif kind == 'BR':
-                _, ep, expected_len = op
-                result = dev.read(ep, expected_len, BULK_TIMEOUT)
-                raw_data.extend(result)
+            # Sleep the original delay (skip tiny <1ms, cap >2s UI interaction gaps)
+            if delay_ms > 2000:
+                time.sleep(0.1)
+            elif delay_ms > 1:
+                time.sleep(delay_ms / 1000.0)
 
-            consecutive_br_fails = 0
+            try:
+                if kind == 'CW':
+                    _, bmRT, bReq, wVal, wIdx, data = op
+                    dev.ctrl_transfer(bmRT, bReq, wVal, wIdx, data, CTRL_TIMEOUT)
+                elif kind == 'CR':
+                    _, bmRT, bReq, wVal, wIdx, wLen = op
+                    dev.ctrl_transfer(bmRT, bReq, wVal, wIdx, wLen, CTRL_TIMEOUT)
+                elif kind == 'BW':
+                    _, ep, data = op
+                    dev.write(ep, data, BULK_TIMEOUT)
+                elif kind == 'BR':
+                    _, ep, expected_len = op
+                    result = dev.read(ep, expected_len, BULK_TIMEOUT)
+                    raw_data.extend(result)
 
-        except Exception as e:
-            if kind == 'BR':
-                consecutive_br_fails += 1
-                if consecutive_br_fails >= 3 and len(raw_data) > 10_000_000:
-                    print(f"\n    Scan data complete: {len(raw_data):,} bytes")
-                    break
-            else:
                 consecutive_br_fails = 0
-                errors += 1
-                if errors <= 10:
-                    print(f"\n    op[{i}] {kind} failed: {e}")
 
-        # Progress
-        if raw_data:
-            progress = min(100, len(raw_data) * 100 // 225_000_000)
-            if progress != last_progress and progress % 2 == 0:
-                last_progress = progress
-                filled = 40 * progress // 100
-                bar = '\u2588' * filled + '\u2591' * (40 - filled)
-                print(f"\r  [{bar}] {progress:3d}% ({len(raw_data):,} bytes)", end='', flush=True)
+            except Exception as e:
+                if kind == 'BR':
+                    consecutive_br_fails += 1
+                    if consecutive_br_fails >= 3 and len(raw_data) > 10_000_000:
+                        break
+                else:
+                    consecutive_br_fails = 0
+                    errors += 1
 
-    print(f"\n  Received {len(raw_data):,} bytes total ({errors} errors)")
+            if len(raw_data) > 0 and i % 50 == 0:
+                mb = len(raw_data) / 1024 / 1024
+                prog.update(task, completed=min(len(raw_data), expected_bytes),
+                            size=f"{mb:.1f} MB")
+
+    console.print(f"  {len(raw_data):,} bytes received", style="dim")
+    if errors:
+        console.print(f"  {errors} non-fatal errors", style="yellow")
     return bytes(raw_data)
 
 
@@ -748,17 +764,15 @@ def extract_image(raw_data, output_file):
     height = SCAN_HEIGHT
     n_lines = len(raw) // SCAN_LINE_U16
     lines = raw[:n_lines * SCAN_LINE_U16].reshape(n_lines, SCAN_LINE_U16)
-    print(f"  Total raw lines: {n_lines}")
 
     odd_lines = lines[1::2]
     n_odd = odd_lines.shape[0]
-    print(f"  Odd lines (used): {n_odd}")
 
     R_START, G_START, B_START = 129, 141, 153
 
     max_needed = B_START + height
     if max_needed > n_odd:
-        print(f"  WARNING: need {max_needed} odd lines but only have {n_odd}")
+        console.print(f"  [yellow]Warning:[/yellow] need {max_needed} odd lines but only have {n_odd}")
         height = n_odd - B_START
 
     col_map = build_col_map()
@@ -768,16 +782,12 @@ def extract_image(raw_data, output_file):
     B = odd_lines[B_START:B_START + height, 2::3][:, col_map]
 
     result = np.stack([R, G, B], axis=2)
-    print(f"  Output: {result.shape} ({result.dtype})")
-    print(f"  R mean={R.astype(float).mean():.0f}, "
-          f"G mean={G.astype(float).mean():.0f}, "
-          f"B mean={B.astype(float).mean():.0f}")
+    console.print(f"  {result.shape[1]}x{result.shape[0]} @ {SCAN_DPI} DPI, 48-bit RGB", style="dim")
 
     import tifffile
-    tifffile.imwrite(output_file, result, photometric='rgb',
-                     resolution=(SCAN_DPI, SCAN_DPI), resolutionunit=2)
-    fsize = os.path.getsize(output_file)
-    print(f"  Saved: {output_file} ({fsize / 1024 / 1024:.1f} MB)")
+    with console.status("Writing TIFF..."):
+        tifffile.imwrite(output_file, result, photometric='rgb',
+                         resolution=(SCAN_DPI, SCAN_DPI), resolutionunit=2)
 
     _save_preview(result, output_file)
     return result
@@ -800,33 +810,162 @@ def _save_preview(data, tiff_path, scale=2):
     base = os.path.splitext(os.path.basename(tiff_path))[0]
     preview_path = os.path.join(preview_dir, f"{base}_preview.png")
     Image.fromarray(preview_8, 'RGB').save(preview_path)
-    print(f"  Preview: {preview_path}")
+    console.print(f"  Preview: [dim]{preview_path}[/dim]")
+
+
+def _next_scan_name(folder):
+    """Find the next scanNNN.tif name in folder."""
+    existing = glob.glob(os.path.join(folder, 'scan[0-9][0-9][0-9].tif'))
+    if not existing:
+        return 'scan001.tif'
+    numbers = []
+    for f in existing:
+        m = re.search(r'scan(\d{3})\.tif$', f)
+        if m:
+            numbers.append(int(m.group(1)))
+    nxt = max(numbers) + 1 if numbers else 1
+    return f'scan{nxt:03d}.tif'
+
+
+def _browse_gui():
+    """Try to open a GUI folder picker. Returns path or None."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        path = filedialog.askdirectory(title='Select scan output folder')
+        root.destroy()
+        return path or None
+    except Exception:
+        return None
+
+
+def _show_folder_info(folder):
+    """Show info about existing scans in folder."""
+    tifs = sorted(glob.glob(os.path.join(folder, 'scan[0-9][0-9][0-9].tif')))
+    other = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))]
+
+    if not other:
+        console.print(f"  Folder is empty.", style="dim")
+        return
+
+    if tifs:
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="cyan")
+        table.add_column(style="dim")
+        for t in tifs[-5:]:  # show last 5
+            name = os.path.basename(t)
+            size = os.path.getsize(t)
+            table.add_row(name, f"{size / 1024 / 1024:.1f} MB")
+        if len(tifs) > 5:
+            console.print(f"  ... {len(tifs) - 5} earlier scans")
+        console.print(table)
+    console.print(f"  {len(other)} file(s) in folder, {len(tifs)} scan(s)", style="dim")
+
+
+def interactive_setup():
+    """Interactive folder/file selection. Returns output file path."""
+    # If a CLI arg was given, use it directly as folder
+    if len(sys.argv) > 1:
+        folder = sys.argv[1]
+    else:
+        console.print()
+        choice = questionary.select(
+            'Output folder:',
+            choices=[
+                questionary.Choice('Use ./scans (default)', value='default'),
+                questionary.Choice('Type a path', value='type'),
+                questionary.Choice('Browse (GUI file picker)', value='gui'),
+            ],
+            default='default',
+        ).ask()
+
+        if choice is None:  # Ctrl+C
+            raise KeyboardInterrupt
+
+        if choice == 'gui':
+            folder = _browse_gui()
+            if not folder:
+                console.print("  GUI picker not available or cancelled, using ./scans", style="yellow")
+                folder = './scans'
+        elif choice == 'type':
+            folder = questionary.path(
+                'Path:',
+                default='./scans',
+                only_directories=True,
+            ).ask()
+            if not folder:
+                raise KeyboardInterrupt
+        else:
+            folder = './scans'
+
+    folder = os.path.abspath(os.path.expanduser(folder))
+
+    if os.path.isdir(folder):
+        _show_folder_info(folder)
+    else:
+        console.print(f"  Creating [cyan]{folder}[/cyan]")
+        os.makedirs(folder, exist_ok=True)
+
+    name = _next_scan_name(folder)
+    output = os.path.join(folder, name)
+    console.print(f"\n  Next scan: [bold green]{name}[/bold green]")
+    console.print(f"  Full path: [dim]{output}[/dim]\n")
+
+    return output
 
 
 def main():
-    output_file = sys.argv[1] if len(sys.argv) > 1 else "scan_output.tif"
+    console.print(Panel(
+        "[bold]Plustek OpticFilm 8200i[/bold]\n"
+        "3200 DPI / 48-bit RGB",
+        title="Film Scanner", border_style="blue",
+    ))
 
-    print("Loading embedded scan commands...")
-    timed_ops = _load_embedded_commands()
-    print(f"  {len(timed_ops)} operations loaded")
+    try:
+        output_file = interactive_setup()
+    except KeyboardInterrupt:
+        console.print("\nCancelled.")
+        sys.exit(0)
 
-    print("Connecting to scanner...")
+    with console.status("Loading embedded scan commands..."):
+        timed_ops = _load_embedded_commands()
+    console.print(f"  [dim]{len(timed_ops)} operations loaded[/dim]")
+
+    console.print("\nConnecting to scanner...")
     dev = find_scanner()
 
     try:
-        print("\nScanning (3200 DPI, 48-bit RGB)...")
-        raw_data = replay_ops(dev, timed_ops)
+        folder = os.path.dirname(output_file)
+        current_output = output_file
 
-        print("\nProcessing image...")
-        extract_image(raw_data, output_file)
+        while True:
+            console.print()
+            raw_data = replay_ops(dev, timed_ops)
 
-        print("\nScan complete!")
+            console.print("\nProcessing image...")
+            extract_image(raw_data, current_output)
+
+            console.print(Panel(
+                f"[bold green]Scan saved:[/bold green] {os.path.basename(current_output)}\n"
+                f"[dim]{current_output} ({os.path.getsize(current_output) / 1024 / 1024:.1f} MB)[/dim]",
+                border_style="green",
+            ))
+
+            again = questionary.confirm('Scan another?', default=True).ask()
+            if not again:
+                break
+
+            name = _next_scan_name(folder)
+            current_output = os.path.join(folder, name)
+            console.print(f"  Next scan: [bold green]{name}[/bold green]")
 
     except KeyboardInterrupt:
-        print("\n\nScan interrupted by user.")
+        console.print("\n\nScan interrupted.", style="yellow")
         sys.exit(1)
     except Exception as e:
-        print(f"\nERROR: {e}")
+        console.print(f"\n[bold red]ERROR:[/bold red] {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
