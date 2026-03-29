@@ -1,0 +1,23 @@
+# Large binary captures
+*.pcap
+
+# Image outputs
+*.tif
+*.tiff
+*.raw
+*.data
+
+# VM files
+*.iso
+*.qcow2
+
+# Python
+__pycache__/
+.venv/
+
+# Intermediate replay data (not needed at runtime)
+capture3200_replay.bin
+capture3200_replay.pkl
+
+# Output directories
+previews/

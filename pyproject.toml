@@ -1,0 +1,12 @@
+[project]
+name = "negafix"
+version = "0.1.0"
+description = "Convert film negative scans into positive images"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+]
+
+[project.scripts]
+negafix = "negafix:main"
